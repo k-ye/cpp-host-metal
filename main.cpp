@@ -13,7 +13,10 @@
 // * https://github.com/naleksiev/mtlpp
 //
 // All <Metal/*> headers are for Obj-C, we cannot import them.
+#include <cstring>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -31,13 +34,22 @@ namespace {
 
 constexpr int kNSUTF8StringEncoding = 4;
 //  Need to have \n at the end, otherwise the compiled library is garbage...
-const char *kernel_src =
-    "#include <metal_stdlib>\n"
-    "using namespace metal;\n"
-    "kernel void add1(device int* data [[ buffer(0) ]],\n"
-    "                 const uint tid [[thread_position_in_grid]]) {\n"
-    "    data[tid] += abs(-42);\n"
-    "}\n";
+// const char *kernel_src =
+//     "#include <metal_stdlib>\n"
+//     "using namespace metal;\n"
+//     "\n"
+//     "kernel void add1(device int *data [[buffer(0)]],\n"
+//     "                 device int *eptr_arr [[buffer(1)]],\n"
+//     "                 const uint tid [[thread_position_in_grid]]) {\n"
+//     "  int64_t data_addr = (int64_t)(data + tid);\n"
+//     "  data[tid] = ((tid & 1) == 0) ? (data_addr) : (data_addr &
+//     0xffffffff);\n"
+//     // "  int64_t eptr_val = eptr_arr[1];\n"
+//     // "  eptr_val = (eptr_val << 32);\n"
+//     // "  eptr_val += eptr_arr[0];\n"
+//     // "  device int *eptr = reinterpret_cast<device int *>(eptr_val);\n"
+//     // "  eptr[tid] = data[tid];\n"
+//     "}\n";
 
 using NSString = objc_object;
 struct MTLDevice;
@@ -164,6 +176,11 @@ void set_mtl_buffer(MTLComputeCommandEncoder *encoder, MTLBuffer *buffer,
   call(encoder, "setBuffer:offset:atIndex:", buffer, offset, index);
 }
 
+void set_mtl_bytes(MTLComputeCommandEncoder *encoder, void *bytes,
+                   size_t length, size_t index) {
+  call(encoder, "setBytes:length:atIndex:", bytes, length, index);
+}
+
 void dispatch_threadgroups(MTLComputeCommandEncoder *encoder, int32_t blocks_x,
                            int32_t blocks_y, int32_t blocks_z,
                            int32_t threads_x, int32_t threads_y,
@@ -213,6 +230,7 @@ public:
     ptr_ = mmap(nullptr, size, PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, /*fd=*/-1,
                 /*offset=*/0);
+    std::memset(ptr_, 0, size_);
   }
 
   size_t size() const { return size_; }
@@ -225,37 +243,30 @@ private:
   void *ptr_;
 };
 
+std::string load_file(const std::string &filename) {
+  std::ifstream infile(filename);
+  std::string line;
+  std::stringstream ss;
+  while (std::getline(infile, line)) {
+    ss << line << '\n';
+  }
+  return ss.str();
+}
+
+constexpr size_t kRootBufferLen = 16;
+constexpr size_t kRootBufferBytes = sizeof(int32_t) * kRootBufferLen;
+
 } // namespace
 
-int main() {
-  MTLDevice *device = mtl_create_system_default_device();
-  std::cout << "mtl_device=" << device << "\n";
-
-  const std::string kernel_src_str(kernel_src);
-  MTLLibrary *kernel_lib = new_library_with_source(
-      device, kernel_src_str.data(), kernel_src_str.size());
-  std::cout << "kernel_lib=" << kernel_lib << "\n";
-
-  const std::string kernel_func_str("add1");
+void run_kernel(const std::string &kernel_name, MTLDevice *device,
+                MTLLibrary *kernel_lib, MTLBuffer *root_buffer) {
   MTLFunction *kernel_func = new_function_with_name(
-      kernel_lib, kernel_func_str.data(), kernel_func_str.size());
+      kernel_lib, kernel_name.data(), kernel_name.size());
   std::cout << "kernel_func=" << kernel_func << "\n";
 
   MTLComputePipelineState *pipeline_state =
       new_compute_pipeline_state_with_function(device, kernel_func);
   std::cout << "pipeline_state=" << pipeline_state << "\n";
-
-  constexpr size_t kBufferLen = 128;
-  constexpr size_t kBufferBytesLen = sizeof(int32_t) * kBufferLen;
-  VMRaii vmr(kBufferBytesLen);
-  void *const vm_ptr = vmr.ptr();
-  std::cout << "vm_ptr=" << vm_ptr << " requested=" << kBufferBytesLen
-            << " got=" << vmr.size() << "\n";
-
-  // MTLBuffer *mtl_buffer = new_mtl_buffer(device, kBufferBytesLen);
-  MTLBuffer *mtl_buffer =
-      new_mtl_buffer_no_copy(device, vm_ptr, vmr.size());
-  std::cout << "mtl_buffer=" << mtl_buffer << "\n";
 
   MTLCommandQueue *cmd_queue = new_command_queue(device);
   std::cout << "cmd_queue=" << cmd_queue << "\n";
@@ -268,10 +279,17 @@ int main() {
   set_compute_pipeline_state(encoder, pipeline_state);
   std::cout << "set_compute_pipeline_state done\n";
 
-  set_mtl_buffer(encoder, mtl_buffer, /*offset=*/0, /*index=*/0);
+  set_mtl_buffer(encoder, root_buffer, /*offset=*/0, /*index=*/0);
+  // set_mtl_buffer(encoder, args_buffer, /*offset=*/0, /*index=*/1);
   std::cout << "set_mtl_buffer done\n";
 
-  dispatch_threadgroups(encoder, kBufferLen, 1);
+  constexpr int kThreadsPerGroup = 1024;
+  const int kThreadGroups =
+      (kRootBufferLen + kThreadsPerGroup - 1) / kThreadsPerGroup;
+  std::cout << "kThreadsPerGroup=" << kThreadsPerGroup
+            << " kThreadGroups=" << kThreadGroups << "\n";
+
+  dispatch_threadgroups(encoder, kThreadsPerGroup, kThreadGroups);
   std::cout << "dispatch_threadgroups done\n";
 
   end_encoding(encoder);
@@ -282,13 +300,62 @@ int main() {
 
   wait_until_completed(cmd_buffer);
   std::cout << "wait_until_completed done\n";
+}
 
-  // int32_t *buffer_contents =
-  //     reinterpret_cast<int32_t *>(mtl_buffer_contents(mtl_buffer));
-  int32_t *buffer_contents = reinterpret_cast<int32_t *>(vm_ptr);
-  for (int i = 0; i < kBufferLen; ++i) {
-    std::cout << "mtl_buffer[" << i << "]=" << buffer_contents[i] << "\n";
+void run_broken_test(MTLDevice *device, MTLLibrary *kernel_lib,
+                     MTLBuffer *root_buffer) {
+
+  run_kernel("broken_test", device, kernel_lib, root_buffer);
+}
+
+void run_human_readable_test(MTLDevice *device, MTLLibrary *kernel_lib,
+                             MTLBuffer *root_buffer) {
+  run_kernel("human_readable_test", device, kernel_lib, root_buffer);
+}
+
+void print_result(const int32_t *buffer_contents) {
+  constexpr int kRowLen = 8;
+  for (int i = 0; i < kRootBufferLen / kRowLen; ++i) {
+    for (int j = 0; j < kRowLen; ++j) {
+      const auto a = buffer_contents[i * kRowLen + j];
+      const auto e = j;
+      if (a != e) {
+        // Red
+        std::cout << "\033[1;31m";
+      } else {
+        // Green
+        std::cout << "\033[1;32m";
+      }
+      std::cout << "root_buffer[" << i << ", " << j << "]=" << a
+                << " expected=" << e;
+      if (a != e) {
+        std::cout << " MISMATCH!!";
+      }
+      std::cout << "\033[0m\n";
+    }
   }
+}
 
+int main() {
+  MTLDevice *device = mtl_create_system_default_device();
+  std::cout << "mtl_device=" << device << "\n";
+
+  const auto kernel_src_str = load_file("kernel.metal");
+  MTLLibrary *kernel_lib = new_library_with_source(
+      device, kernel_src_str.data(), kernel_src_str.size());
+  std::cout << "kernel_lib=" << kernel_lib << "\n";
+
+  VMRaii root_mem(kRootBufferBytes);
+  std::cout << "root_mem=" << root_mem.ptr()
+            << " requested=" << kRootBufferBytes << " got=" << root_mem.size()
+            << "\n";
+
+  MTLBuffer *root_buffer =
+      new_mtl_buffer_no_copy(device, root_mem.ptr(), root_mem.size());
+  std::cout << "root_buffer=" << root_buffer << "\n";
+
+  run_broken_test(device, kernel_lib, root_buffer);
+  // run_human_readable_test(device, kernel_lib, root_buffer);
+  print_result(reinterpret_cast<int32_t *>(root_mem.ptr()));
   return 0;
 }
